@@ -42,7 +42,7 @@ func main() {
 	if *target != "" {
 		tc := NewTorClient()
 		defer tc.Close()
-		resp, err := tc.Fetch(*target)
+		resp, err := tc.Fetch(*target, "")
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -125,11 +125,15 @@ type TorClient struct {
 	torCtx *tor.Tor
 }
 
-func (tc *TorClient) Get(target string) (*http.Response, error) {
+func (tc *TorClient) Get(target, referer string) (*http.Response, error) {
 	req, err := http.NewRequest("GET", target, nil)
 	if err != nil {
 		return nil, err
 	}
+	if referer != "" {
+		req.Header.Set("Referer", referer)
+	}
+
 	req.Header.Set("User-Agent", *ua)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
 	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
@@ -143,6 +147,8 @@ func (tc *TorClient) PostForm(target string, data url.Values) (*http.Response, e
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("Referer", target)
+
 	req.Header.Set("User-Agent", *ua)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
@@ -184,8 +190,8 @@ func NewTorClient() *TorClient {
 	}
 }
 
-func (tc *TorClient) Fetch(target string) (*http.Response, error) {
-	resp, err := tc.Get(target)
+func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
+	resp, err := tc.Get(target, referer)
 	if err != nil {
 		return nil, err
 	}
