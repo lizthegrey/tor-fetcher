@@ -34,7 +34,7 @@ var length = flag.Int("l", 32, "Length")
 var goroutines = flag.Int("g", (1+runtime.NumCPU())/2, "Goroutines")
 
 var target = flag.String("target", "", "The URL to retrieve")
-var ua = flag.String("ua", "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0", "Tor user agent by default")
+var ua = flag.String("ua", "Mozilla/5.0 (Windows NT 10.0; rv:102.0) Gecko/20100101 Firefox/102.0", "Tor user agent by default")
 
 func main() {
 	flag.Parse()
