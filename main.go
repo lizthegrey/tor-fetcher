@@ -34,6 +34,7 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
+	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 
 	tc := NewTorClient()
 	defer tc.Close()
