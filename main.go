@@ -13,10 +13,9 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"runtime"
+	"os"
 	"strconv"
 	"strings"
-	"sync"
 
 	"golang.org/x/crypto/argon2"
 
@@ -24,73 +23,40 @@ import (
 	"github.com/ipsn/go-libtor"
 )
 
-var salt = flag.String("salt", "", "Salt")
-var prefix = flag.String("prefix", "", "Prefix")
-var difficulty = flag.Int("difficulty", 3, "Difficulty")
-var iterations = flag.Int("t", 1, "Iterations")
-var memory = flag.Int("k", 512, "Memory")
 var parallelism = flag.Int("p", 1, "Parallelism")
 var length = flag.Int("l", 32, "Length")
-var goroutines = flag.Int("g", (1+runtime.NumCPU())/2, "Goroutines")
-
-var target = flag.String("target", "", "The URL to retrieve")
+var target = flag.String("target", "", "The URL to retrieve (required)")
 var ua = flag.String("ua", "Mozilla/5.0 (Windows NT 10.0; rv:102.0) Gecko/20100101 Firefox/102.0", "Tor user agent by default")
 
 func main() {
 	flag.Parse()
-
-	if *target != "" {
-		tc := NewTorClient()
-		defer tc.Close()
-		resp, err := tc.Fetch(*target, "")
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		defer resp.Body.Close()
-
-		var reader io.ReadCloser
-		switch resp.Header.Get("Content-Encoding") {
-		case "gzip":
-			reader, err = gzip.NewReader(resp.Body)
-			defer reader.Close()
-		default:
-			reader = resp.Body
-		}
-		body, err := ioutil.ReadAll(reader)
-		if err != nil {
-			log.Fatal(err)
-		}
-		fmt.Println(string(body))
-		return
+	if *target == "" {
+		flag.Usage()
+		os.Exit(1)
 	}
 
-	// Otherwise we're running the benchmark tests on a single supplied prefix and salt.
-	p := ArgonParams{
-		memory:      uint32(*memory),
-		iterations:  uint32(*iterations),
-		parallelism: uint8(*parallelism),
-		keyLength:   uint32(*length),
-		difficulty:  *difficulty,
-		prefix:      *prefix,
-		salt:        *salt,
+	tc := NewTorClient()
+	defer tc.Close()
+	resp, err := tc.Fetch(*target, "")
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	var wg sync.WaitGroup
-	result := -1
-	for g := 0; g < *goroutines; g++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			for n := i; result == -1; n += *goroutines {
-				if p.Check(n) {
-					result = n
-				}
-			}
-		}(g)
+	defer resp.Body.Close()
+
+	var reader io.ReadCloser
+	switch resp.Header.Get("Content-Encoding") {
+	case "gzip":
+		reader, err = gzip.NewReader(resp.Body)
+		defer reader.Close()
+	default:
+		reader = resp.Body
 	}
-	wg.Wait()
-	fmt.Println(result)
+	body, err := ioutil.ReadAll(reader)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(string(body))
 }
 
 type ArgonParams struct {
