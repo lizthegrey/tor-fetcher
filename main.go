@@ -42,6 +42,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if resp.StatusCode != http.StatusOK {
+		log.Fatalf("Non-200 status code: %d\n", resp.StatusCode)
+	}
 
 	defer resp.Body.Close()
 
@@ -164,7 +167,7 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 	}
 
 	// Check whether we were allowed direct access.
-	if resp.StatusCode != 403 {
+	if resp.StatusCode != http.StatusForbidden {
 		// If so (eg due to passing captcha earlier), then return
 		// the http.Response for caller to do what it will.
 		return resp, nil
