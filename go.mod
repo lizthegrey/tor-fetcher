@@ -1,6 +1,6 @@
 module github.com/lizthgrey/tor-fetcher
 
-go 1.21
+go 1.21.0
 
 require (
 	github.com/cretz/bine v0.2.0
