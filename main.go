@@ -16,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/argon2"
 
@@ -141,7 +142,15 @@ func NewTorClient() *TorClient {
 	if err != nil {
 		log.Fatalf("Failed to create Tor Context = %v\n", err)
 	}
-	dialer, err := torCtx.Dialer(ctx, nil)
+	var dialer *tor.Dialer
+	for retry := 0; retry < 3; retry++ {
+		timeoutCtx, done := context.WithTimeout(ctx, 15*time.Second)
+		dialer, err = torCtx.Dialer(timeoutCtx, nil)
+		done()
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		log.Fatalf("Failed to create dialer for Tor Context - %v\n", err)
 	}
