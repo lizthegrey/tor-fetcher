@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/argon2"
+	"github.com/lizthegrey/tor-fetcher/crypto"
 
 	"github.com/cretz/bine/tor"
 	"github.com/ipsn/go-libtor"
@@ -62,33 +62,6 @@ func main() {
 		log.Fatal(err)
 	}
 	fmt.Println(string(body))
-}
-
-type ArgonParams struct {
-	memory      uint32
-	iterations  uint32
-	parallelism uint8
-	keyLength   uint32
-	difficulty  int
-	prefix      string
-	salt        string
-}
-
-func (p ArgonParams) Check(n int) bool {
-	password := fmt.Sprintf("%s%d", p.prefix, n)
-	hash := argon2.IDKey([]byte(password), []byte(p.salt), p.iterations, p.memory, p.parallelism, p.keyLength)
-	for i, v := range hash[:(p.difficulty+1)/2] {
-		if 2*i == p.difficulty {
-			return true
-		}
-		if v != 0 {
-			if 2*i+1 == p.difficulty && v>>4 == 0 {
-				return true
-			}
-			break
-		}
-	}
-	return false
 }
 
 type TorClient struct {
@@ -175,6 +148,17 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 		return nil, err
 	}
 
+	// Check whether we need to complete a SHA check.
+	if resp.StatusCode == http.StatusNonAuthoritativeInfo {
+		// for attempt := 0; ; attempt++ {
+		//   input := fmt.Sprintf("%s%s", salt, attempt)
+		//   hash := SHA256(input)
+		//   if clz32(hash.words[0]) >= difficulty {
+		//     return Hex(input)
+		//   }
+		// }
+	}
+
 	// Check whether we were allowed direct access.
 	if resp.StatusCode != http.StatusForbidden {
 		// If so (eg due to passing captcha earlier), then return
@@ -182,10 +166,10 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 		return resp, nil
 	}
 
-	// Otherwise, do the captcha dance.
+	// Otherwise, do the Argon2 captcha dance.
 	defer resp.Body.Close()
 
-	var p ArgonParams
+	var p crypto.ArgonParams
 	var pow string
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
@@ -205,35 +189,35 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 				// data-pow="234a8b1a036dd6aee9c2745b31ffb1b8#2b8e80f38873205a65c14f9055b6ad0567b7690d8cd0fc73ac55882f32457045#fa725558ce6c1a9343265dd2abaddde7acfdd8af56c6e7269b3fddc4b6c29884"
 				pow = value
 				params := strings.Split(pow, "#")
-				p.salt = params[0]
-				p.prefix = params[1]
+				p.Salt = params[0]
+				p.Prefix = params[1]
 			case "data-time":
 				// data-time="1"
 				iters, err := strconv.Atoi(value)
 				if err != nil {
 					log.Fatal(err)
 				}
-				p.iterations = uint32(iters)
+				p.Iterations = uint32(iters)
 			case "data-diff":
 				// data-diff="24"
 				bits, err := strconv.Atoi(value)
 				if err != nil {
 					log.Fatal(err)
 				}
-				p.difficulty = bits / 8
+				p.Difficulty = bits / 8
 			case "data-kb":
 				// data-kb="512"
 				mem, err := strconv.Atoi(value)
 				if err != nil {
 					log.Fatal(err)
 				}
-				p.memory = uint32(mem)
+				p.Memory = uint32(mem)
 			default:
 				log.Fatalf("Unexpected key: %s", key)
 			}
 		}
-		p.parallelism = uint8(*parallelism)
-		p.keyLength = uint32(*length)
+		p.Parallelism = uint8(*parallelism)
+		p.KeyLength = uint32(*length)
 		break
 	}
 	if err := scanner.Err(); err != nil {
