@@ -1,14 +1,16 @@
 module github.com/lizthgrey/tor-fetcher
 
-go 1.21.0
+go 1.25.0
 
 require (
-	github.com/cretz/bine v0.2.0
-	github.com/ipsn/go-libtor v1.0.380
-	golang.org/x/crypto v0.25.0
+	github.com/refraction-networking/utls v1.8.2
+	golang.org/x/crypto v0.47.0
+	golang.org/x/net v0.49.0
 )
 
 require (
-	golang.org/x/net v0.21.0 // indirect
-	golang.org/x/sys v0.22.0 // indirect
+	github.com/andybalholm/brotli v1.0.6 // indirect
+	github.com/klauspost/compress v1.17.4 // indirect
+	golang.org/x/sys v0.40.0 // indirect
+	golang.org/x/text v0.33.0 // indirect
 )
