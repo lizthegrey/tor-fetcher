@@ -4,30 +4,32 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
-	"crypto/tls"
+	"crypto/sha256"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
-	"time"
+	"sync"
 
+	utls "github.com/refraction-networking/utls"
 	"golang.org/x/crypto/argon2"
-
-	"github.com/cretz/bine/tor"
-	"github.com/ipsn/go-libtor"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/proxy"
 )
 
 var parallelism = flag.Int("p", 1, "Parallelism")
 var length = flag.Int("l", 32, "Length")
 var target = flag.String("target", "", "The URL to retrieve (required)")
-var ua = flag.String("ua", "Mozilla/5.0 (Windows NT 10.0; rv:102.0) Gecko/20100101 Firefox/102.0", "Tor user agent by default")
+var ua = flag.String("ua", "Mozilla/5.0 (Windows NT 10.0; rv:140.0) Gecko/20100101 Firefox/140.0", "Tor user agent by default")
+var socksAddr = flag.String("proxy", "socks5://127.0.0.1:9050", "SOCKS5 proxy address for Tor")
 
 func main() {
 	flag.Parse()
@@ -35,10 +37,7 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
-	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-
 	tc := NewTorClient()
-	defer tc.Close()
 	resp, err := tc.Fetch(*target, "")
 	if err != nil {
 		log.Fatal(err)
@@ -57,7 +56,7 @@ func main() {
 	default:
 		reader = resp.Body
 	}
-	body, err := ioutil.ReadAll(reader)
+	body, err := io.ReadAll(reader)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -75,6 +74,9 @@ type ArgonParams struct {
 }
 
 func (p ArgonParams) Check(n int) bool {
+	if p.difficulty == 0 {
+		return true
+	}
 	password := fmt.Sprintf("%s%d", p.prefix, n)
 	hash := argon2.IDKey([]byte(password), []byte(p.salt), p.iterations, p.memory, p.parallelism, p.keyLength)
 	for i, v := range hash[:(p.difficulty+1)/2] {
@@ -91,9 +93,47 @@ func (p ArgonParams) Check(n int) bool {
 	return false
 }
 
+type TartarusParams struct {
+	salt       string
+	difficulty uint
+}
+
+func (p TartarusParams) Check(n int) bool {
+	input := p.salt + strconv.Itoa(n)
+	hash := sha256.Sum256([]byte(input))
+	val := binary.BigEndian.Uint32(hash[:4])
+	return val < (1 << (32 - p.difficulty))
+}
+
+// extractAttr extracts the value of an HTML attribute from a string.
+// e.g. extractAttr(`<html data-foo="bar">`, "data-foo") returns "bar".
+func extractAttr(s, attr string) string {
+	key := attr + `="`
+	idx := strings.Index(s, key)
+	if idx == -1 {
+		return ""
+	}
+	start := idx + len(key)
+	end := strings.Index(s[start:], `"`)
+	if end == -1 {
+		return ""
+	}
+	return s[start : start+end]
+}
+
 type TorClient struct {
-	c      http.Client
-	torCtx *tor.Tor
+	c http.Client
+}
+
+func setHeaders(req *http.Request, referer string) {
+	if referer != "" {
+		req.Header.Set("Referer", referer)
+	}
+	req.Header.Set("User-Agent", *ua)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
 }
 
 func (tc *TorClient) Get(target, referer string) (*http.Response, error) {
@@ -101,95 +141,261 @@ func (tc *TorClient) Get(target, referer string) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	if referer != "" {
-		req.Header.Set("Referer", referer)
-	}
-
-	req.Header.Set("User-Agent", *ua)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	setHeaders(req, referer)
 	return tc.c.Do(req)
 }
 
-func (tc *TorClient) PostForm(target string, data url.Values) (*http.Response, error) {
+func (tc *TorClient) PostForm(target, referer string, data url.Values) (*http.Response, error) {
 	req, err := http.NewRequest("POST", target, strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Referer", target)
-
-	req.Header.Set("User-Agent", *ua)
+	setHeaders(req, referer)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
 	return tc.c.Do(req)
 }
 
-func (tc *TorClient) Close() {
-	tc.torCtx.Close()
+// utlsTransport is an http.RoundTripper that dials TLS with utls
+// (for browser-like fingerprints) and dispatches to HTTP/2 or HTTP/1.1
+// based on the ALPN-negotiated protocol.
+type utlsTransport struct {
+	dialTLS func(ctx context.Context, network, addr string) (net.Conn, error)
+
+	mu      sync.Mutex
+	h2Conns map[string]*http2.ClientConn
 }
 
-func NewTorClient() *TorClient {
-	ctx := context.Background()
-	torCtx, err := tor.Start(
-		ctx,
-		&tor.StartConf{ProcessCreator: libtor.Creator},
-	)
-	if err != nil {
-		log.Fatalf("Failed to create Tor Context = %v\n", err)
+func (t *utlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	addr := req.URL.Hostname()
+	port := req.URL.Port()
+	if port == "" {
+		port = "443"
 	}
-	var dialer *tor.Dialer
-	for retry := 0; retry < 3; retry++ {
-		timeoutCtx, done := context.WithTimeout(ctx, 15*time.Second)
-		dialer, err = torCtx.Dialer(timeoutCtx, nil)
-		done()
+	hostPort := net.JoinHostPort(addr, port)
+
+	// Try reusing a cached HTTP/2 connection.
+	t.mu.Lock()
+	cc := t.h2Conns[hostPort]
+	t.mu.Unlock()
+	if cc != nil {
+		//log.Printf("transport: reusing h2 conn for %s %s", req.Method, req.URL)
+		resp, err := cc.RoundTrip(req)
 		if err == nil {
-			break
+			return resp, nil
 		}
+		//log.Printf("transport: cached h2 conn failed: %v, dialing new", err)
+		t.mu.Lock()
+		delete(t.h2Conns, hostPort)
+		t.mu.Unlock()
+	} else {
+		//log.Printf("transport: no cached conn for %s %s, dialing new", req.Method, req.URL)
 	}
-	if err != nil {
-		log.Fatalf("Failed to create dialer for Tor Context - %v\n", err)
-	}
-	jar, _ := cookiejar.New(nil)
-	httpClient := http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			Proxy:           http.ProxyFromEnvironment,
-			DialContext:     dialer.DialContext,
-		},
-		Jar: jar,
-	}
-	return &TorClient{
-		c:      httpClient,
-		torCtx: torCtx,
-	}
-}
 
-func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
-	resp, err := tc.Get(target, referer)
+	conn, err := t.dialTLS(req.Context(), "tcp", hostPort)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check whether we were allowed direct access.
-	if resp.StatusCode != http.StatusForbidden {
-		// If so (eg due to passing captcha earlier), then return
-		// the http.Response for caller to do what it will.
-		return resp, nil
+	// Check ALPN negotiated protocol.
+	alpn := ""
+	if uconn, ok := conn.(*utls.UConn); ok {
+		alpn = uconn.ConnectionState().NegotiatedProtocol
 	}
 
-	// Otherwise, do the captcha dance.
-	defer resp.Body.Close()
+	if alpn == "h2" {
+		cc, err := (&http2.Transport{}).NewClientConn(conn)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		t.mu.Lock()
+		if t.h2Conns == nil {
+			t.h2Conns = make(map[string]*http2.ClientConn)
+		}
+		t.h2Conns[hostPort] = cc
+		t.mu.Unlock()
+		return cc.RoundTrip(req)
+	}
 
+	// HTTP/1.1 fallback.
+	if err := req.Write(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return resp, nil
+}
+
+func NewTorClient() *TorClient {
+	proxyURL, err := url.Parse(*socksAddr)
+	if err != nil {
+		log.Fatalf("Failed to parse proxy URL %q: %v\n", *socksAddr, err)
+	}
+	socksDialer, err := proxy.FromURL(proxyURL, proxy.Direct)
+	if err != nil {
+		log.Fatalf("Failed to create SOCKS dialer: %v\n", err)
+	}
+
+	dialTLS := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			host = addr
+		}
+		// TCP dial through the SOCKS5 proxy.
+		rawConn, err := socksDialer.(proxy.ContextDialer).DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		// TLS handshake with Firefox fingerprint.
+		cfg := &utls.Config{ServerName: host}
+		uConn := utls.UClient(rawConn, cfg, utls.HelloFirefox_Auto)
+		if err := uConn.HandshakeContext(ctx); err != nil {
+			rawConn.Close()
+			return nil, err
+		}
+		return uConn, nil
+	}
+
+	jar, _ := cookiejar.New(nil)
+	httpClient := http.Client{
+		Transport: &utlsTransport{dialTLS: dialTLS},
+		Jar:       jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Don't follow redirects automatically; Fetch() handles them.
+			return http.ErrUseLastResponse
+		},
+	}
+	return &TorClient{c: httpClient}
+}
+
+func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
+	currentURL := target
+	currentReferer := referer
+
+	for range 10 { // max redirect/challenge hops
+		resp, err := tc.Get(currentURL, currentReferer)
+		if err != nil {
+			return nil, err
+		}
+
+		// Follow redirects manually (we disabled auto-follow).
+		if loc := resp.Header.Get("Location"); loc != "" &&
+			(resp.StatusCode >= 300 && resp.StatusCode < 400) {
+			resp.Body.Close()
+			resolved, err := resp.Request.URL.Parse(loc)
+			if err != nil {
+				return nil, fmt.Errorf("bad redirect Location %q: %w", loc, err)
+			}
+			//log.Printf("Following redirect: %s -> %s", currentURL, resolved)
+			currentReferer = currentURL
+			currentURL = resolved.String()
+			continue
+		}
+
+		// Not a challenge — return directly.
+		if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusNonAuthoritativeInfo {
+			return resp, nil
+		}
+
+		// Read the challenge body.
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		body := string(bodyBytes)
+		requestURL := resp.Request.URL
+
+		if strings.Contains(body, "data-ttrs-challenge") {
+			challengeResp, err := tc.solveTartarus(requestURL, body)
+			if err != nil {
+				return nil, err
+			}
+			// solveTartarus returns the re-GET response; loop to
+			// handle further redirects or challenges on the new domain.
+			if loc := challengeResp.Header.Get("Location"); loc != "" &&
+				(challengeResp.StatusCode >= 300 && challengeResp.StatusCode < 400) {
+				challengeResp.Body.Close()
+				resolved, err := requestURL.Parse(loc)
+				if err != nil {
+					return nil, fmt.Errorf("bad redirect Location %q: %w", loc, err)
+				}
+				//log.Printf("Following redirect after challenge: %s -> %s", requestURL, resolved)
+				currentReferer = requestURL.String()
+				currentURL = resolved.String()
+				continue
+			}
+			return challengeResp, nil
+		}
+		return tc.solveBasedFlare(requestURL, body)
+	}
+	return nil, fmt.Errorf("too many redirects/challenges")
+}
+
+func (tc *TorClient) solveTartarus(requestURL *url.URL, body string) (*http.Response, error) {
+	salt := extractAttr(body, "data-ttrs-challenge")
+	diffStr := extractAttr(body, "data-ttrs-difficulty")
+	difficulty, err := strconv.Atoi(diffStr)
+	if err != nil {
+		return nil, fmt.Errorf("parsing tartarus difficulty: %w", err)
+	}
+
+	p := TartarusParams{salt: salt, difficulty: uint(difficulty)}
+
+	// Brute-force SHA256 PoW from nonce=0.
+	var nonce int
+	for n := 0; ; n++ {
+		if p.Check(n) {
+			nonce = n
+			break
+		}
+	}
+
+	// POST the solution to /.ttrs/challenge as an XHR.
+	challengeURL := fmt.Sprintf("%s://%s/.ttrs/challenge", requestURL.Scheme, requestURL.Host)
+	values := url.Values{}
+	values.Set("salt", salt)
+	values.Set("nonce", strconv.Itoa(nonce))
+	//log.Printf("Tartarus: salt=%s difficulty=%d nonce=%d", salt, difficulty, nonce)
+	req, err := http.NewRequest("POST", challengeURL, strings.NewReader(values.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("building tartarus POST: %w", err)
+	}
+	req.Header.Set("Referer", requestURL.String())
+	req.Header.Set("User-Agent", *ua)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	postResp, err := tc.c.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("posting tartarus solution: %w", err)
+	}
+	postBody, _ := io.ReadAll(postResp.Body)
+	postResp.Body.Close()
+	//log.Printf("Tartarus POST: status=%d body=%s", postResp.StatusCode, postBody)
+	//log.Printf("Tartarus POST: Set-Cookie=%v", postResp.Header["Set-Cookie"])
+	if postResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("tartarus challenge POST returned %d", postResp.StatusCode)
+	}
+
+	// Check what cookies the jar has for this URL.
+	if tc.c.Jar != nil {
+		cookies := tc.c.Jar.Cookies(requestURL)
+		//log.Printf("Tartarus: cookies for %s: %v", requestURL, cookies)
+	}
+
+	// Re-GET the original target (cookie jar preserves ttrs_clearance).
+	return tc.Get(requestURL.String(), requestURL.String())
+}
+
+func (tc *TorClient) solveBasedFlare(requestURL *url.URL, body string) (*http.Response, error) {
 	var p ArgonParams
 	var pow string
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		l := scanner.Text()
+	for _, l := range strings.Split(body, "\n") {
 		if !strings.HasPrefix(l, "\t<body data") {
 			continue
 		}
@@ -202,42 +408,35 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 			value := split[1][1 : len(split[1])-1]
 			switch key {
 			case "data-pow":
-				// data-pow="234a8b1a036dd6aee9c2745b31ffb1b8#2b8e80f38873205a65c14f9055b6ad0567b7690d8cd0fc73ac55882f32457045#fa725558ce6c1a9343265dd2abaddde7acfdd8af56c6e7269b3fddc4b6c29884"
 				pow = value
 				params := strings.Split(pow, "#")
 				p.salt = params[0]
 				p.prefix = params[1]
 			case "data-time":
-				// data-time="1"
 				iters, err := strconv.Atoi(value)
 				if err != nil {
-					log.Fatal(err)
+					return nil, fmt.Errorf("parsing basedflare time: %w", err)
 				}
 				p.iterations = uint32(iters)
 			case "data-diff":
-				// data-diff="24"
 				bits, err := strconv.Atoi(value)
 				if err != nil {
-					log.Fatal(err)
+					return nil, fmt.Errorf("parsing basedflare diff: %w", err)
 				}
 				p.difficulty = bits / 8
 			case "data-kb":
-				// data-kb="512"
 				mem, err := strconv.Atoi(value)
 				if err != nil {
-					log.Fatal(err)
+					return nil, fmt.Errorf("parsing basedflare kb: %w", err)
 				}
 				p.memory = uint32(mem)
 			default:
-				log.Fatalf("Unexpected key: %s", key)
+				return nil, fmt.Errorf("unexpected basedflare key: %s", key)
 			}
 		}
 		p.parallelism = uint8(*parallelism)
 		p.keyLength = uint32(*length)
 		break
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
 	}
 
 	// Run the POW, single-threaded in case another circuit is running.
@@ -249,10 +448,9 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 		}
 	}
 
-	// Post the result back to the checker. This will yield a redirect to
-	// our true target.
+	// Post the result back to the checker.
 	values := url.Values{}
 	values.Set("pow_response", fmt.Sprintf("%s#%d", pow, result))
 	values.Set("submit", "submit")
-	return tc.PostForm(resp.Request.URL.String(), values)
+	return tc.PostForm(requestURL.String(), requestURL.String(), values)
 }
