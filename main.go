@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -30,9 +31,13 @@ var length = flag.Int("l", 32, "Length")
 var target = flag.String("target", "", "The URL to retrieve (required)")
 var ua = flag.String("ua", "Mozilla/5.0 (Windows NT 10.0; rv:140.0) Gecko/20100101 Firefox/140.0", "Tor user agent by default")
 var socksAddr = flag.String("proxy", "socks5://127.0.0.1:9050", "SOCKS5 proxy address for Tor")
+var debug = flag.Bool("debug", false, "Enable debug logging")
 
 func main() {
 	flag.Parse()
+	if *debug {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	}
 	if *target == "" {
 		flag.Usage()
 		os.Exit(1)
@@ -178,17 +183,17 @@ func (t *utlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	cc := t.h2Conns[hostPort]
 	t.mu.Unlock()
 	if cc != nil {
-		//log.Printf("transport: reusing h2 conn for %s %s", req.Method, req.URL)
+		slog.Debug("transport: reusing h2 conn", "method", req.Method, "url", req.URL)
 		resp, err := cc.RoundTrip(req)
 		if err == nil {
 			return resp, nil
 		}
-		//log.Printf("transport: cached h2 conn failed: %v, dialing new", err)
+		slog.Debug("transport: cached h2 conn failed, dialing new", "err", err)
 		t.mu.Lock()
 		delete(t.h2Conns, hostPort)
 		t.mu.Unlock()
 	} else {
-		//log.Printf("transport: no cached conn for %s %s, dialing new", req.Method, req.URL)
+		slog.Debug("transport: no cached conn, dialing new", "method", req.Method, "url", req.URL)
 	}
 
 	conn, err := t.dialTLS(req.Context(), "tcp", hostPort)
@@ -290,7 +295,7 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 			if err != nil {
 				return nil, fmt.Errorf("bad redirect Location %q: %w", loc, err)
 			}
-			//log.Printf("Following redirect: %s -> %s", currentURL, resolved)
+			slog.Debug("following redirect", "from", currentURL, "to", resolved)
 			currentReferer = currentURL
 			currentURL = resolved.String()
 			continue
@@ -324,7 +329,7 @@ func (tc *TorClient) Fetch(target, referer string) (*http.Response, error) {
 				if err != nil {
 					return nil, fmt.Errorf("bad redirect Location %q: %w", loc, err)
 				}
-				//log.Printf("Following redirect after challenge: %s -> %s", requestURL, resolved)
+				slog.Debug("following redirect after challenge", "from", requestURL, "to", resolved)
 				currentReferer = requestURL.String()
 				currentURL = resolved.String()
 				continue
@@ -360,7 +365,7 @@ func (tc *TorClient) solveTartarus(requestURL *url.URL, body string) (*http.Resp
 	values := url.Values{}
 	values.Set("salt", salt)
 	values.Set("nonce", strconv.Itoa(nonce))
-	//log.Printf("Tartarus: salt=%s difficulty=%d nonce=%d", salt, difficulty, nonce)
+	slog.Debug("tartarus challenge solved", "salt", salt, "difficulty", difficulty, "nonce", nonce)
 	req, err := http.NewRequest("POST", challengeURL, strings.NewReader(values.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("building tartarus POST: %w", err)
@@ -376,16 +381,14 @@ func (tc *TorClient) solveTartarus(requestURL *url.URL, body string) (*http.Resp
 	}
 	postBody, _ := io.ReadAll(postResp.Body)
 	postResp.Body.Close()
-	//log.Printf("Tartarus POST: status=%d body=%s", postResp.StatusCode, postBody)
-	//log.Printf("Tartarus POST: Set-Cookie=%v", postResp.Header["Set-Cookie"])
+	slog.Debug("tartarus POST response", "status", postResp.StatusCode, "body", string(postBody))
+	slog.Debug("tartarus POST cookies", "set-cookie", postResp.Header["Set-Cookie"])
 	if postResp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("tartarus challenge POST returned %d", postResp.StatusCode)
 	}
 
-	// Check what cookies the jar has for this URL.
 	if tc.c.Jar != nil {
-		cookies := tc.c.Jar.Cookies(requestURL)
-		//log.Printf("Tartarus: cookies for %s: %v", requestURL, cookies)
+		slog.Debug("tartarus jar cookies", "url", requestURL, "cookies", tc.c.Jar.Cookies(requestURL))
 	}
 
 	// Re-GET the original target (cookie jar preserves ttrs_clearance).
