@@ -1,4 +1,4 @@
-module github.com/lizthgrey/tor-fetcher
+module github.com/endharassment/tor-fetcher
 
 go 1.25.0
 
